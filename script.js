@@ -8,7 +8,7 @@ const SPREADSHEET_URL =
 const LOAD_TIMEOUT_MS = 15000;
 const AUTO_REFRESH_MS = 30000;
 
-const STORAGE_KEY = "successPathSequencePosition";
+const STORAGE_KEY = "successPathShuffleState";
 
 const memberIdElement = document.getElementById("memberId");
 const adNameElement = document.getElementById("adName");
@@ -19,18 +19,105 @@ const nextButton = document.getElementById("nextButton");
 const resetButton = document.getElementById("resetButton");
 
 let adsData = [];
-let currentIndex = 0;
+let shuffledAdKeys = [];
+let currentPosition = 0;
 let loadTimeoutId;
 let isInitialLoad = true;
 
-function getSavedIndex() {
-  const savedIndex = Number.parseInt(localStorage.getItem(STORAGE_KEY), 10);
-  const isValidIndex =
-    Number.isInteger(savedIndex) &&
-    savedIndex >= 0 &&
-    savedIndex < adsData.length;
+function getAdKey(ad) {
+  return `${ad.memberId}\u001f${ad.url}`;
+}
 
-  return isValidIndex ? savedIndex : 0;
+function shuffleArray(items) {
+  const shuffledItems = [...items];
+
+  for (let index = shuffledItems.length - 1; index > 0; index -= 1) {
+    const randomIndex = Math.floor(Math.random() * (index + 1));
+    [shuffledItems[index], shuffledItems[randomIndex]] = [
+      shuffledItems[randomIndex],
+      shuffledItems[index]
+    ];
+  }
+
+  return shuffledItems;
+}
+
+function createShuffledOrder(previousAdKey = "") {
+  const adKeys = adsData.map(getAdKey);
+  const shuffledKeys = shuffleArray(adKeys);
+
+  if (
+    shuffledKeys.length > 1 &&
+    previousAdKey &&
+    shuffledKeys[0] === previousAdKey
+  ) {
+    const swapIndex = 1 + Math.floor(Math.random() * (shuffledKeys.length - 1));
+    [shuffledKeys[0], shuffledKeys[swapIndex]] = [
+      shuffledKeys[swapIndex],
+      shuffledKeys[0]
+    ];
+  }
+
+  return shuffledKeys;
+}
+
+function getSavedShuffleState() {
+  try {
+    const savedState = JSON.parse(localStorage.getItem(STORAGE_KEY));
+
+    if (!Array.isArray(savedState?.order)) {
+      return null;
+    }
+
+    return {
+      order: savedState.order.filter((key) => typeof key === "string"),
+      position: Number.isInteger(savedState.position)
+        ? savedState.position
+        : 0
+    };
+  } catch {
+    return null;
+  }
+}
+
+function saveShuffleState() {
+  localStorage.setItem(
+    STORAGE_KEY,
+    JSON.stringify({
+      order: shuffledAdKeys,
+      position: currentPosition
+    })
+  );
+}
+
+function reconcileShuffleState(savedState = null) {
+  const availableAdKeys = adsData.map(getAdKey);
+  const availableAdKeySet = new Set(availableAdKeys);
+  const sourceOrder = savedState?.order || shuffledAdKeys;
+  const sourcePosition = savedState?.position ?? currentPosition;
+  const currentAdKey = sourceOrder[sourcePosition];
+  const retainedKeys = sourceOrder.filter(
+    (key, index) =>
+      availableAdKeySet.has(key) && sourceOrder.indexOf(key) === index
+  );
+  const retainedKeySet = new Set(retainedKeys);
+  const newKeys = shuffleArray(
+    availableAdKeys.filter((key) => !retainedKeySet.has(key))
+  );
+
+  shuffledAdKeys = [...retainedKeys, ...newKeys];
+  currentPosition = shuffledAdKeys.indexOf(currentAdKey);
+
+  if (currentPosition < 0) {
+    currentPosition = 0;
+  }
+
+  saveShuffleState();
+}
+
+function getCurrentAd() {
+  const currentAdKey = shuffledAdKeys[currentPosition];
+  return adsData.find((ad) => getAdKey(ad) === currentAdKey);
 }
 
 function setStatus(message, isError = false) {
@@ -49,12 +136,21 @@ function displayCurrentAd() {
     return;
   }
 
-  const currentAd = adsData[currentIndex];
-  const progressPercentage = ((currentIndex + 1) / adsData.length) * 100;
+  const currentAd = getCurrentAd();
+
+  if (!currentAd) {
+    reconcileShuffleState();
+    displayCurrentAd();
+    return;
+  }
+
+  const progressPercentage =
+    ((currentPosition + 1) / shuffledAdKeys.length) * 100;
 
   memberIdElement.textContent = currentAd.memberId || "Unknown member";
   adNameElement.textContent = currentAd.adName || "Unnamed opportunity";
-  sequenceCounterElement.textContent = `${currentIndex + 1} / ${adsData.length}`;
+  sequenceCounterElement.textContent =
+    `${currentPosition + 1} / ${shuffledAdKeys.length}`;
   progressFillElement.style.width = `${progressPercentage}%`;
   nextButton.disabled = false;
   setStatus("Click NEXT to continue your success journey.");
@@ -112,21 +208,15 @@ function receiveSpreadsheetData(response) {
     return;
   }
 
-  const currentMemberId = adsData[currentIndex]?.memberId;
   adsData = updatedAdsData;
 
   if (isInitialLoad) {
-    currentIndex = getSavedIndex();
+    reconcileShuffleState(getSavedShuffleState());
     isInitialLoad = false;
   } else {
-    const updatedIndex = adsData.findIndex(
-      (ad) => ad.memberId === currentMemberId
-    );
-
-    currentIndex = updatedIndex >= 0 ? updatedIndex : getSavedIndex();
+    reconcileShuffleState();
   }
 
-  localStorage.setItem(STORAGE_KEY, String(currentIndex));
   displayCurrentAd();
 }
 
@@ -186,17 +276,23 @@ function openCurrentAd() {
     return;
   }
 
-  const currentAd = adsData[currentIndex];
+  const currentAd = getCurrentAd();
 
-  if (!isValidUrl(currentAd.url)) {
+  if (!currentAd || !isValidUrl(currentAd.url)) {
     setStatus("This opportunity does not have a valid URL.", true);
     return;
   }
 
   window.open(currentAd.url, "_blank", "noopener,noreferrer");
 
-  currentIndex = (currentIndex + 1) % adsData.length;
-  localStorage.setItem(STORAGE_KEY, String(currentIndex));
+  if (currentPosition >= shuffledAdKeys.length - 1) {
+    shuffledAdKeys = createShuffledOrder(getAdKey(currentAd));
+    currentPosition = 0;
+  } else {
+    currentPosition += 1;
+  }
+
+  saveShuffleState();
   displayCurrentAd();
 }
 
@@ -206,10 +302,13 @@ function resetSequence() {
     return;
   }
 
-  currentIndex = 0;
-  localStorage.setItem(STORAGE_KEY, String(currentIndex));
+  const currentAd = getCurrentAd();
+  const currentAdKey = currentAd ? getAdKey(currentAd) : "";
+  shuffledAdKeys = createShuffledOrder(currentAdKey);
+  currentPosition = 0;
+  saveShuffleState();
   displayCurrentAd();
-  setStatus("Sequence reset. Your journey starts from the first opportunity.");
+  setStatus("Sequence reset. A new fair rotation has started.");
 }
 
 nextButton.addEventListener("click", openCurrentAd);
